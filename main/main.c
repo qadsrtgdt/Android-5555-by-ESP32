@@ -132,6 +132,17 @@ static void start_rx(void)
     usb_host_transfer_submit(ctx.rx);
 }
 
+/* 认证通过后发正式 CNXN(banner) 建立连接 */
+static void send_cnxn_banner(void)
+{
+    uint8_t ba[8 + 6];
+    uint32_t ver = ADB_VERSION, mpl = ADB_MAX_PAYLOAD;
+    memcpy(ba, &ver, 4);
+    memcpy(ba + 4, &mpl, 4);
+    memcpy(ba + 8, "host::", 6);
+    send_packet(ADB_CMD_CONNECT, 0, 0, ba, 8 + 6);
+}
+
 /* 用当前 auth_token 做 RSA 签名并发回 AUTH(SIGNATURE) */
 static void sign_and_send_auth(void)
 {
@@ -170,6 +181,11 @@ static void handle_rx_data(const uint8_t *buf, size_t len)
             memcpy(ctx.auth_token, payload, 20);
             sign_and_send_auth();
             ctx.state = ADB_ST_WAIT_AUTH_OK;
+        } else if (cmd == ADB_CMD_OKAY) {
+            /* 公钥已被手机信任：adbd 直接放行、不再走 AUTH，发 CNXN banner */
+            ESP_LOGI(TAG, "公钥已被信任，跳过认证，发 CNXN banner");
+            send_cnxn_banner();
+            ctx.state = ADB_ST_WAIT_CNXN_OK;
         }
         break;
 
@@ -183,13 +199,8 @@ static void handle_rx_data(const uint8_t *buf, size_t len)
             memcpy(ctx.auth_token, payload, 20);
             sign_and_send_auth();
         } else if (cmd == ADB_CMD_OKAY) {
-            ESP_LOGI(TAG, "认证成功(OKAY)，重发 CNXN banner");
-            uint8_t ba[8 + 6];
-            uint32_t ver = ADB_VERSION, mpl = ADB_MAX_PAYLOAD;
-            memcpy(ba, &ver, 4);
-            memcpy(ba + 4, &mpl, 4);
-            memcpy(ba + 8, "host::", 6);
-            send_packet(ADB_CMD_CONNECT, 0, 0, ba, 8 + 6);
+            ESP_LOGI(TAG, "认证成功(OKAY)，发 CNXN banner");
+            send_cnxn_banner();
             ctx.state = ADB_ST_WAIT_CNXN_OK;
         }
         break;
