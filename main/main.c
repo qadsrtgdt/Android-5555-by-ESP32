@@ -112,7 +112,7 @@ static void send_packet(uint32_t cmd, uint32_t arg0, uint32_t arg1,
     ctx.tx->bEndpointAddress = ctx.ep_out_addr;
     ctx.tx->timeout_ms      = 2000;
     ctx.tx->context         = (void *)1;   /* 1 = TX */
-    ctx.tx->callback        = NULL;        /* 发送完成无需处理 */
+    /* callback 必须保持 transfer_cb（v5.3 靠它驱动状态机，不能置 NULL） */
 
     ESP_LOGI(TAG, "[TX] cmd=0x%08X arg0=%u arg1=%u len=%u", (unsigned)cmd,
              (unsigned)arg0, (unsigned)arg1, (unsigned)len);
@@ -128,8 +128,20 @@ static void start_rx(void)
     ctx.rx->bEndpointAddress = ctx.ep_in_addr;
     ctx.rx->timeout_ms      = 5000;
     ctx.rx->context         = (void *)2;  /* 2 = RX */
-    ctx.rx->callback        = NULL;
+    /* callback 必须保持 transfer_cb，否则收到的包不会被处理 */
     usb_host_transfer_submit(ctx.rx);
+}
+
+/* 用当前 auth_token 做 RSA 签名并发回 AUTH(SIGNATURE) */
+static void sign_and_send_auth(void)
+{
+    uint8_t sig[256];
+    if (adb_rsa_sign(adb_private_key_pem, ctx.auth_token, sig) == 0) {
+        send_packet(ADB_CMD_AUTH, ADB_AUTH_SIGNATURE, 0, sig, 256);
+    } else {
+        ESP_LOGE(TAG, "RSA 签名失败");
+        ctx.state = ADB_ST_ERR;
+    }
 }
 
 /* ---------------- 处理收到的 ADB 包（推进状态机） ---------------- */
@@ -144,24 +156,20 @@ static void handle_rx_data(const uint8_t *buf, size_t len)
         ESP_LOGE(TAG, "包校验失败 magic=0x%08X", (unsigned)hdr->magic);
         return;
     }
+    if (hdr->data_len && adb_crc32(payload, hdr->data_len) != hdr->data_crc32) {
+        ESP_LOGE(TAG, "包 CRC32 校验失败");
+        return;
+    }
     ESP_LOGI(TAG, "[RX] cmd=0x%08X arg0=%u arg1=%u len=%u", (unsigned)cmd,
              (unsigned)hdr->arg0, (unsigned)hdr->arg1, (unsigned)hdr->data_len);
 
     switch (ctx.state) {
 
     case ADB_ST_WAIT_AUTH_TOKEN:
-        if (cmd == ADB_CMD_AUTH && hdr->arg0 == ADB_AUTH_TOKEN) {
-            if (hdr->data_len >= 20) {
-                memcpy(ctx.auth_token, payload, 20);
-                uint8_t sig[256];
-                if (adb_rsa_sign(adb_private_key_pem, ctx.auth_token, sig) == 0) {
-                    send_packet(ADB_CMD_AUTH, ADB_AUTH_SIGNATURE, 0, sig, 256);
-                    ctx.state = ADB_ST_WAIT_AUTH_OK;
-                } else {
-                    ESP_LOGE(TAG, "RSA 签名失败");
-                    ctx.state = ADB_ST_ERR;
-                }
-            }
+        if (cmd == ADB_CMD_AUTH && hdr->arg0 == ADB_AUTH_TOKEN && hdr->data_len >= 20) {
+            memcpy(ctx.auth_token, payload, 20);
+            sign_and_send_auth();
+            ctx.state = ADB_ST_WAIT_AUTH_OK;
         }
         break;
 
@@ -170,6 +178,10 @@ static void handle_rx_data(const uint8_t *buf, size_t len)
             /* adbd 请求公钥用于授权确认弹窗 */
             send_packet(ADB_CMD_AUTH, ADB_AUTH_RSAPUB, 0,
                         (const uint8_t *)adb_openssh_pubkey, strlen(adb_openssh_pubkey));
+        } else if (cmd == ADB_CMD_AUTH && hdr->arg0 == ADB_AUTH_TOKEN && hdr->data_len >= 20) {
+            /* 第二次 TOKEN：弹窗授权后 adbd 重新发挑战，需再次签名（状态保持，等 OKAY） */
+            memcpy(ctx.auth_token, payload, 20);
+            sign_and_send_auth();
         } else if (cmd == ADB_CMD_OKAY) {
             ESP_LOGI(TAG, "认证成功(OKAY)，重发 CNXN banner");
             uint8_t ba[8 + 6];
