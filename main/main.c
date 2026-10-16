@@ -52,6 +52,10 @@ typedef struct {
 static adb_ctx_t ctx;
 static usb_host_client_handle_t g_client = NULL;
 
+/* RX 累积缓冲：处理粘包/跨包（一个 USB IN 传输可能含多个 ADB 包，或一个包被拆分） */
+static uint8_t rx_accum[24 + ADB_MAX_PAYLOAD];
+static uint32_t rx_accum_len = 0;
+
 /* ---------------- USB 枚举：找 CDC/ADB 接口的两个 Bulk 端点 ---------------- */
 static int find_bulk_eps(const usb_config_desc_t *cfg, uint16_t total_len,
                          uint8_t *out_ep_in, uint8_t *out_ep_out)
@@ -135,12 +139,12 @@ static void start_rx(void)
 /* 认证通过后发正式 CNXN(banner) 建立连接 */
 static void send_cnxn_banner(void)
 {
-    uint8_t ba[8 + 6];
+    uint8_t ba[8 + 7];
     uint32_t ver = ADB_VERSION, mpl = ADB_MAX_PAYLOAD;
     memcpy(ba, &ver, 4);
     memcpy(ba + 4, &mpl, 4);
-    memcpy(ba + 8, "host::", 6);
-    send_packet(ADB_CMD_CONNECT, 0, 0, ba, 8 + 6);
+    memcpy(ba + 8, "host::\0", 7);       /* banner 需以 '\0' 终止 */
+    send_packet(ADB_CMD_CONNECT, 0, 0, ba, 8 + 7);
 }
 
 /* 用当前 auth_token 做 RSA 签名并发回 AUTH(SIGNATURE) */
@@ -191,9 +195,10 @@ static void handle_rx_data(const uint8_t *buf, size_t len)
 
     case ADB_ST_WAIT_AUTH_OK:
         if (cmd == ADB_CMD_AUTH && hdr->arg0 == ADB_AUTH_RSAPUB) {
-            /* adbd 请求公钥用于授权确认弹窗 */
-            send_packet(ADB_CMD_AUTH, ADB_AUTH_RSAPUB, 0,
-                        (const uint8_t *)adb_openssh_pubkey, strlen(adb_openssh_pubkey));
+            /* adbd 请求公钥用于授权确认弹窗：必须发 ADB wire 二进制 blob（非文本） */
+            const uint8_t *blob; size_t blob_len;
+            if (adb_pubkey_blob(&blob, &blob_len) == 0)
+                send_packet(ADB_CMD_AUTH, ADB_AUTH_RSAPUB, 0, blob, (uint32_t)blob_len);
         } else if (cmd == ADB_CMD_AUTH && hdr->arg0 == ADB_AUTH_TOKEN && hdr->data_len >= 20) {
             /* 第二次 TOKEN：弹窗授权后 adbd 重新发挑战，需再次签名（状态保持，等 OKAY） */
             memcpy(ctx.auth_token, payload, 20);
@@ -241,16 +246,44 @@ static void handle_rx_data(const uint8_t *buf, size_t len)
 }
 
 /* ---------------- 传输完成回调（v5.3: 由 client handle_events 驱动） ---------------- */
+
+/* 累积 RX 数据并拆出完整 ADB 包逐个处理 */
+static void handle_rx_bytes(const uint8_t *data, size_t len)
+{
+    if (rx_accum_len + len > sizeof(rx_accum)) {
+        ESP_LOGW(TAG, "RX 缓冲溢出，重置");
+        rx_accum_len = 0;
+        return;
+    }
+    memcpy(rx_accum + rx_accum_len, data, len);
+    rx_accum_len += len;
+
+    while (rx_accum_len >= sizeof(adb_pkt_t)) {
+        const adb_pkt_t *hdr = (const adb_pkt_t *)rx_accum;
+        uint32_t data_len = hdr->data_len;
+        uint32_t need = sizeof(adb_pkt_t) + data_len;
+        if (data_len > ADB_MAX_PAYLOAD || need > sizeof(rx_accum)) {
+            ESP_LOGE(TAG, "非法 data_len=%u，重置", (unsigned)data_len);
+            rx_accum_len = 0;
+            return;
+        }
+        if (rx_accum_len < need) break;   /* 包未收全，等更多数据 */
+        handle_rx_data(rx_accum, need);
+        memmove(rx_accum, rx_accum + need, rx_accum_len - need);
+        rx_accum_len -= need;
+        if (ctx.state == ADB_ST_ERR || ctx.state == ADB_ST_DONE) break;
+    }
+}
+
 static void transfer_cb(usb_transfer_t *t)
 {
     if ((int)t->context == 2) {                 /* RX 完成 */
         if (t->status == USB_TRANSFER_STATUS_COMPLETED) {
-            handle_rx_data(t->data_buffer, (size_t)t->actual_num_bytes);
-            if (ctx.state != ADB_ST_ERR) start_rx();
+            handle_rx_bytes(t->data_buffer, (size_t)t->actual_num_bytes);
         } else {
             ESP_LOGW(TAG, "RX status=%d", (int)t->status);
-            start_rx();
         }
+        if (ctx.state != ADB_ST_ERR && ctx.state != ADB_ST_DONE) start_rx();
     }
     /* context==1 为 TX，无需处理 */
 }
@@ -282,14 +315,17 @@ static void open_and_init(uint8_t addr)
     }
     /* v5.3: claim 接口后端点自动分配，传输直接使用端点地址，无需 ep_alloc */
 
-    /* 启动 ADB 握手：发 CNXN(带公钥) */
+    /* 启动 ADB 握手：发 CNXN(带公钥)。公钥必须是 ADB wire 二进制 blob（非文本） */
     uint8_t cbuf[8 + 512];
     uint32_t ver = ADB_VERSION, mpl = ADB_MAX_PAYLOAD;
     memcpy(cbuf, &ver, 4);
     memcpy(cbuf + 4, &mpl, 4);
-    size_t kl = strlen(adb_openssh_pubkey);
-    memcpy(cbuf + 8, adb_openssh_pubkey, kl);
-    send_packet(ADB_CMD_CONNECT, 0, 0, cbuf, 8 + (uint32_t)kl);
+    const uint8_t *blob; size_t blob_len;
+    if (adb_pubkey_blob(&blob, &blob_len) != 0) {
+        ESP_LOGE(TAG, "公钥 blob 解码失败"); return;
+    }
+    memcpy(cbuf + 8, blob, blob_len);
+    send_packet(ADB_CMD_CONNECT, 0, 0, cbuf, 8 + (uint32_t)blob_len);
     ctx.state = ADB_ST_WAIT_AUTH_TOKEN;
     start_rx();
 }

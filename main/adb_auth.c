@@ -2,6 +2,7 @@
 #include "mbedtls/pk.h"
 #include "mbedtls/entropy.h"
 #include "mbedtls/ctr_drbg.h"
+#include "mbedtls/base64.h"
 #include <string.h>
 
 /* =========================================================================
@@ -90,4 +91,33 @@ int adb_rsa_sign(const char *pem_key, const uint8_t *challenge, uint8_t *out_sig
                           mbedtls_ctr_drbg_random, &ctr_drbg);
     mbedtls_pk_free(&pk);
     return (ret == 0 && sig_len == 256) ? 0 : (ret ? ret : -1);
+}
+
+/* 把 OpenSSH 文本公钥（"ssh-rsa AAAA..."）base64 解码成 ADB wire 二进制 blob。
+ * ADB 协议中公钥以 OpenSSH 二进制格式传输，不是文本行。 */
+int adb_pubkey_blob(const uint8_t **out, size_t *out_len)
+{
+    static uint8_t blob[512];
+    static int ready = 0;
+    static size_t blob_len = 0;
+
+    if (!ready) {
+        const char *p = adb_openssh_pubkey;
+        const char *sp = strchr(p, ' ');
+        if (sp) p = sp + 1;              /* 去掉 "ssh-rsa " 前缀 */
+        size_t inlen = strlen(p);
+        while (inlen && (p[inlen-1] == '\n' || p[inlen-1] == '\r' || p[inlen-1] == ' '))
+            inlen--;                     /* 去掉尾部空白 */
+        size_t olen = 0;
+        if (mbedtls_base64_decode(blob, sizeof(blob), &olen,
+                                  (const unsigned char *)p, inlen) == 0 && olen > 0) {
+            blob_len = olen;
+            ready = 1;
+        } else {
+            return -1;
+        }
+    }
+    *out = blob;
+    *out_len = blob_len;
+    return 0;
 }

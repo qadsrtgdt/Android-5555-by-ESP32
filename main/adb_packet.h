@@ -18,7 +18,7 @@
 #define ADB_AUTH_RSAPUB    3
 
 /* ADB 协议版本 & 最大包长 */
-#define ADB_VERSION        0x01000000u  /* 小端即 version=1 */
+#define ADB_VERSION        0x01000001u  /* 小端即 version=1.0.1（兼容新 adbd） */
 #define ADB_MAX_PAYLOAD    0x00001000u  /* 4096 */
 
 /* ADB 包头结构（24 字节，所有字段小端 uint32） */
